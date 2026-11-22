@@ -3,8 +3,12 @@ function element(id) {
     return document.getElementById(id);
 }
 const start = element('start');
+const arena = element('arena');
 const pause = element('pause');
 const overlay = element('overlay');
+const loading = element('loading');
+const levelTransition = element('level-transition');
+const levelNumber = element('level-number');
 const title = element('title');
 const message = element('message');
 const health = element('health');
@@ -16,31 +20,25 @@ const thumb = stick.querySelector('i');
 const field = element('field');
 const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const introMusic = element('intro-music');
+const gameMusic = element('game-music');
+const firstLevelMusic = gameMusic.src;
 const musicToggle = element('music-toggle');
 function setupIntroMusic() {
-    const preference = 'orman-muhafizi:intro-music';
     let enabled = true;
-    try {
-        enabled = localStorage.getItem(preference) !== 'off';
-    }
-    catch {
-        // Playback remains available when storage is disabled.
-    }
     const updateLabel = () => {
-        const playing = !introMusic.paused;
-        const label = playing ? 'Müziği kapat' : 'Müziği aç';
-        musicToggle.dataset.playing = String(playing);
+        const label = enabled ? 'Müziği kapat' : 'Müziği aç';
+        musicToggle.dataset.playing = String(enabled);
         musicToggle.setAttribute('aria-label', label);
         musicToggle.title = label;
     };
     const play = () => {
-        if (enabled && !musicToggle.hidden && introMusic.paused) {
-            void introMusic.play().catch(updateLabel);
+        if (enabled && introMusic.paused) {
+            void introMusic.play().catch(() => {
+                // The next interaction can unlock playback.
+            });
         }
     };
     introMusic.volume = .45;
-    introMusic.addEventListener('playing', updateLabel);
-    introMusic.addEventListener('pause', updateLabel);
     introMusic.addEventListener('error', () => {
         musicToggle.setAttribute('aria-label', 'Müzik yüklenemedi');
         musicToggle.title = 'Müzik yüklenemedi';
@@ -48,28 +46,26 @@ function setupIntroMusic() {
     });
     musicToggle.addEventListener('click', () => {
         enabled = introMusic.paused;
-        try {
-            localStorage.setItem(preference, enabled ? 'on' : 'off');
-        }
-        catch {
-            // The control still works for the current visit.
-        }
+        updateLabel();
         if (enabled)
             play();
         else
             introMusic.pause();
     });
     const playAfterInteraction = (event) => {
-        if (event.target instanceof Element && event.target.closest('button'))
+        if (event.target instanceof Element && event.target.closest('#music-toggle, #start'))
             return;
         play();
     };
-    overlay.addEventListener('click', playAfterInteraction);
+    document.addEventListener('click', playAfterInteraction);
+    document.addEventListener('keydown', playAfterInteraction);
     start.addEventListener('click', () => {
         introMusic.pause();
         musicToggle.hidden = true;
-        overlay.removeEventListener('click', playAfterInteraction);
+        document.removeEventListener('click', playAfterInteraction);
+        document.removeEventListener('keydown', playAfterInteraction);
     }, { once: true });
+    updateLabel();
     play();
 }
 setupIntroMusic();
@@ -88,9 +84,13 @@ class Forest extends Phaser.Scene {
         this.mode = 'intro';
         this.shadows = [];
         this.arrows = [];
+        this.companions = [];
         this.sparks = [];
+        this.scorePopups = new Set();
         this.seed = null;
         this.elapsed = 0;
+        this.level = 1;
+        this.transitionRemaining = 0;
         this.nextShadow = 1;
         this.nextSeed = 7;
         this.nextShot = 0;
@@ -108,14 +108,21 @@ class Forest extends Phaser.Scene {
         this.floor = Array.from({ length: 270 }, () => ({ x: random.frac(), y: random.frac() }));
         this.place();
         this.scale.on('resize', () => this.place());
+        gameMusic.volume = .35;
         start.disabled = false;
         start.addEventListener('click', () => {
             if (this.mode !== 'paused')
                 this.reset();
             this.mode = 'playing';
+            this.playGameMusic();
             pause.disabled = false;
             overlay.hidden = true;
             field.focus({ preventScroll: true });
+            if (window.matchMedia('(any-pointer: coarse)').matches && document.fullscreenEnabled && !document.fullscreenElement) {
+                void arena.requestFullscreen().catch(() => {
+                    // The arena still fills the available viewport.
+                });
+            }
         });
         field.tabIndex = -1;
         pause.addEventListener('click', () => this.suspend());
@@ -184,6 +191,9 @@ class Forest extends Phaser.Scene {
         field.addEventListener('pointerup', release);
         field.addEventListener('pointercancel', release);
         field.addEventListener('lostpointercapture', release);
+        loading.hidden = true;
+        overlay.hidden = false;
+        musicToggle.hidden = false;
     }
     place() {
         const { width, height } = this.scale;
@@ -198,13 +208,23 @@ class Forest extends Phaser.Scene {
         }
     }
     reset() {
+        if (gameMusic.src !== firstLevelMusic)
+            gameMusic.src = firstLevelMusic;
+        gameMusic.currentTime = 0;
         this.elapsed = this.nextShot = this.protectedUntil = this.cleared = 0;
+        this.level = 1;
         this.nextShadow = 1;
         this.nextSeed = 7;
         this.vitality = 100;
         this.shadows = [];
         this.arrows = [];
+        this.companions = [];
         this.sparks = [];
+        for (const popup of this.scorePopups) {
+            this.tweens.killTweensOf(popup);
+            popup.destroy();
+        }
+        this.scorePopups.clear();
         this.seed = null;
         this.player = { x: this.tree.x, y: this.scale.height * .72 };
         this.heading = 0;
@@ -214,6 +234,7 @@ class Forest extends Phaser.Scene {
         this.status();
     }
     display(heading, body, action) {
+        gameMusic.pause();
         this.keys.clear();
         this.walking = false;
         this.firing = false;
@@ -236,12 +257,14 @@ class Forest extends Phaser.Scene {
     }
     finish(won) {
         this.mode = 'done';
+        this.companions = [];
         this.display(won ? 'Orman güvende!' : 'Ağacın ışığı söndü', won ? `${this.cleared} orku geri püskürttün. Işık ağacı yeniden parlıyor!`
             : `${this.cleared} orku geri püskürttün. Altın tohumlar, ağacı kısa süre korur.`, 'Yeniden oyna');
     }
     status() {
-        const remaining = Math.ceil(60 - this.elapsed);
+        const remaining = Math.ceil(this.level * 60 - this.elapsed);
         time.textContent = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`;
+        levelNumber.textContent = String(this.level);
         health.value = Math.max(0, this.vitality);
         score.textContent = String(this.cleared);
         shield.hidden = this.elapsed >= this.protectedUntil;
@@ -249,10 +272,48 @@ class Forest extends Phaser.Scene {
     update(clock, delta) {
         if (this.mode === 'playing')
             this.step(Math.min(.05, delta / 1000));
+        else if (this.mode === 'transition') {
+            this.transitionRemaining -= delta;
+            if (this.transitionRemaining <= 0) {
+                levelTransition.hidden = true;
+                this.mode = 'playing';
+                pause.disabled = false;
+            }
+        }
         this.paint(clock / 1000);
     }
+    playGameMusic() {
+        void gameMusic.play().catch(() => {
+            // Gameplay remains available if audio playback fails.
+        });
+    }
+    advanceLevel() {
+        this.mode = 'transition';
+        this.level = 2;
+        this.companions.push({
+            kind: 'wizard', position: this.companionPosition(-1), heading: this.heading,
+            expiresAt: 120, nextShot: this.elapsed
+        });
+        gameMusic.src = './ikinci-seviye-muzigi.mp3';
+        this.playGameMusic();
+        this.transitionRemaining = 2500;
+        this.nextShadow = this.elapsed + 1.2;
+        this.vitality = Math.min(100, this.vitality + 25);
+        this.shadows = [];
+        this.arrows = [];
+        this.keys.clear();
+        this.walking = false;
+        this.firing = false;
+        this.queuedShot = null;
+        this.touch = null;
+        stick.hidden = true;
+        pause.disabled = true;
+        this.burst(this.tree, 0xffdf85);
+        this.status();
+        levelTransition.hidden = false;
+    }
     step(dt) {
-        this.elapsed = Math.min(60, this.elapsed + dt);
+        this.elapsed = Math.min(this.level * 60, this.elapsed + dt);
         const { width, height } = this.scale;
         const held = (one, two) => Number(this.keys.has(one) || this.keys.has(two));
         let dx = held('KeyD', 'ArrowRight') - held('KeyA', 'ArrowLeft');
@@ -268,14 +329,20 @@ class Forest extends Phaser.Scene {
         this.player.x = Phaser.Math.Clamp(this.player.x + dx / length * dt * 225, 18, width - 18);
         this.player.y = Phaser.Math.Clamp(this.player.y + dy / length * dt * 225, 18, height - 18);
         if (this.elapsed >= this.nextShadow) {
-            const angle = Math.random() * Math.PI * 2;
-            const reach = Math.max(width, height);
-            this.shadows.push({
-                x: Phaser.Math.Clamp(this.tree.x + Math.cos(angle) * reach, -18, width + 18),
-                y: Phaser.Math.Clamp(this.tree.y + Math.sin(angle) * reach, -18, height + 18),
-                speed: 58 + this.elapsed * .8 + Math.random() * 18, attack: 0
-            });
-            this.nextShadow = this.elapsed + Math.max(.57, 2.15 - this.elapsed * .027);
+            const waveAngle = Math.random() * Math.PI * 2;
+            const levelTime = this.elapsed - (this.level - 1) * 60;
+            const waveSize = this.level === 1 ? 1 : levelTime < 30 ? 2 : 3;
+            for (let index = 0; index < waveSize; index++) {
+                const angle = waveAngle + index * Math.PI * 2 / waveSize;
+                const reach = Math.max(width, height);
+                this.shadows.push({
+                    x: Phaser.Math.Clamp(this.tree.x + Math.cos(angle) * reach, -18, width + 18),
+                    y: Phaser.Math.Clamp(this.tree.y + Math.sin(angle) * reach, -18, height + 18),
+                    speed: 58 + levelTime * .8 + (this.level - 1) * 12 + Math.random() * 18, attack: 0
+                });
+            }
+            const interval = this.level === 1 ? 2.15 - levelTime * .027 : 1.75 - levelTime * .014;
+            this.nextShadow = this.elapsed + Math.max(.57, interval);
         }
         if (!this.seed && this.elapsed >= this.nextSeed) {
             const angle = Math.random() * Math.PI * 2;
@@ -303,13 +370,13 @@ class Forest extends Phaser.Scene {
         const turn = Math.atan2(Math.sin(desired - this.heading), Math.cos(desired - this.heading));
         this.heading += Phaser.Math.Clamp(turn, -dt * 10, dt * 10);
         if (hasTarget && Math.abs(turn) <= dt * 10 + .01 && this.elapsed >= this.nextShot) {
-            this.arrows.push({ ...this.player, vx: Math.cos(desired) * 635, vy: Math.sin(desired) * 635, life: 1.4 });
+            this.fireArrow(this.player, desired, .45);
             this.queuedShot = null;
             this.nextShot = this.elapsed + .27;
-            if (this.cache.audio.exists('arrow-swish')) {
-                this.sound.play('arrow-swish', { volume: .45 });
-            }
         }
+        this.companions = this.companions.filter(companion => this.elapsed < companion.expiresAt);
+        for (const companion of this.companions)
+            this.updateCompanion(companion);
         for (const arrow of this.arrows) {
             arrow.x += arrow.vx * dt;
             arrow.y += arrow.vy * dt;
@@ -319,10 +386,18 @@ class Forest extends Phaser.Scene {
             const hit = this.shadows.findIndex(shadow => distance(shadow, arrow) < 24);
             if (hit < 0)
                 continue;
-            this.burst(this.shadows[hit], 0xffe6a1);
+            const orc = this.shadows[hit];
+            this.burst(orc, arrow.magic ? 0xa7efff : 0xffe6a1);
             this.shadows.splice(hit, 1);
             arrow.life = 0;
             this.cleared++;
+            this.showHitScore(orc);
+            if (this.cleared === 10) {
+                this.companions.push({
+                    kind: 'archer', position: this.companionPosition(1), heading: this.heading,
+                    expiresAt: this.elapsed + 10, nextShot: this.elapsed
+                });
+            }
         }
         this.arrows = this.arrows.filter(arrow => arrow.life > 0);
         for (const shadow of this.shadows) {
@@ -346,8 +421,80 @@ class Forest extends Phaser.Scene {
         }
         this.sparks = this.sparks.filter(spark => spark.life > 0);
         this.status();
-        if (this.vitality <= 0 || this.elapsed >= 60)
-            this.finish(this.vitality > 0);
+        if (this.vitality <= 0)
+            this.finish(false);
+        else if (this.elapsed >= this.level * 60) {
+            if (this.level === 1)
+                this.advanceLevel();
+            else
+                this.finish(true);
+        }
+    }
+    fireArrow(origin, heading, volume) {
+        this.arrows.push({ ...origin, vx: Math.cos(heading) * 635, vy: Math.sin(heading) * 635, life: 1.4 });
+        if (this.cache.audio.exists('arrow-swish'))
+            this.sound.play('arrow-swish', { volume });
+    }
+    companionPosition(side) {
+        const { x, y } = this.player;
+        const { width, height } = this.scale;
+        const preferred = x + side * 52;
+        if (preferred >= 18 && preferred <= width - 18)
+            return { x: preferred, y };
+        return { x, y: y + (y + 48 <= height - 18 ? 48 : -48) };
+    }
+    updateCompanion(companion) {
+        const wizard = companion.kind === 'wizard';
+        companion.position = this.companionPosition(wizard ? -1 : 1);
+        let target = null;
+        let closest = 635 * 1.4;
+        for (const orc of this.shadows) {
+            const gap = distance(companion.position, orc);
+            if (gap >= closest)
+                continue;
+            target = orc;
+            closest = gap;
+        }
+        if (!target)
+            return;
+        const { x, y } = companion.position;
+        companion.heading = Math.atan2(target.y - y, target.x - x);
+        if (this.elapsed >= companion.nextShot) {
+            if (wizard) {
+                this.arrows.push({
+                    x, y, vx: Math.cos(companion.heading) * 635, vy: Math.sin(companion.heading) * 635,
+                    life: 1.4, magic: true
+                });
+            }
+            else {
+                this.fireArrow(companion.position, companion.heading, .25);
+            }
+            companion.nextShot = this.elapsed + (wizard ? .9 : .6);
+        }
+    }
+    showHitScore(point) {
+        const x = Phaser.Math.Clamp(point.x, 22, this.scale.width - 22);
+        const y = Math.max(52, point.y - 35);
+        const popup = this.add.text(x, y, '+1', {
+            fontFamily: 'system-ui, sans-serif',
+            fontSize: '25px',
+            fontStyle: 'bold',
+            color: '#ffdf85',
+            stroke: '#101b18',
+            strokeThickness: 4
+        }).setOrigin(.5).setDepth(1);
+        this.scorePopups.add(popup);
+        this.tweens.add({
+            targets: popup,
+            y: y - 32,
+            alpha: 0,
+            duration: 800,
+            ease: 'Quad.In',
+            onComplete: () => {
+                this.scorePopups.delete(popup);
+                popup.destroy();
+            }
+        });
     }
     burst(point, color) {
         for (let index = 0; index < 9; index++) {
@@ -375,44 +522,64 @@ class Forest extends Phaser.Scene {
         const line = (color, width, ax, ay, bx, by) => g.lineStyle(width, color).lineBetween(px(ax), py(ay, ax), px(bx), py(by, bx));
         g.fillStyle(0x081311, .75).fillEllipse(x, y + 18, elf ? 46 : 53, 16);
         if (elf) {
-            polygon(0x153a31, [-13, -20, 3, -17, 6, 12, -8, 16, -22, 12, -17, -2]);
-            polygon(0x4e8063, [-13, -17, -7, -14, -10, 10, -20, 12]);
-            line(0x49342c, 7, -5, 4, -8 + stride, 15);
-            line(0x7b5540, 7, 4, 4, 5 - stride, 15);
-            oval(0x271e20, -7 + stride, 16, 11, 6);
-            oval(0x392b29, 7 - stride, 16, 11, 6);
-            line(0x865e42, 5, -13, 1, -19, -31);
-            for (const offset of [-2, 2])
-                line(0xe4d7a7, 2, -17 + offset, -25, -20 + offset, -35);
-            if (depth < 0)
-                oval(0x234e3c, -5, -6, Math.abs(depth) * 49, 28);
-            if (depth > 0)
-                oval(0x795136, 0, -7, Math.abs(depth) * 42, 25);
-            polygon(0x795136, [-10, -19, 8, -18, 11, 5, -8, 7]);
-            polygon(0x9c7552, [-8, -15, -3, -16, 6, 4, 1, 5]);
-            line(0xd5b272, 3, -8, 1, 9, 0);
-            oval(0x234e3c, -1, -27, 29, 30);
-            polygon(0x5f9071, [-16, -29, -8, -42, 2, -42, 11, -32, -2, -35]);
-            if (depth > 0)
-                oval(0xdba57d, 5, -25, 16 + depth * 7, 19);
-            else if (depth > -.34)
-                oval(0xdba57d, 5, -25, 16 + depth * 23, 19);
-            polygon(0xebba90, [-9, -29, 1, -25, -5, -20]);
-            polygon(0xa65d35, [1, -35, 12, -34, 13, -29, 5, -30, -1, -24]);
-            if (depth > -.34)
-                oval(0x26342c, 10, -25, 3, 2.5);
-            line(0x59775a, 8, 2, -15, 12, -11);
-            line(0xe4b38d, 5, 11, -11, 21, -12);
-            line(0xdcc390, 2, 23, -27, 23, 4);
+            const forward = Math.sin(facing);
+            const side = Math.abs(horizontal);
+            const project = (ahead, across, height) => ({
+                x: px(ahead) - forward * across,
+                y: py(height, ahead) + horizontal * across * .45
+            });
+            const joint = (color, width, from, to) => {
+                const a = project(...from);
+                const b = project(...to);
+                g.lineStyle(width, color).lineBetween(a.x, a.y, b.x, b.y);
+            };
+            const farSide = horizontal >= 0 ? -1 : 1;
+            for (const leg of [farSide, -farSide]) {
+                const step = stride * leg;
+                joint(leg === farSide ? 0x49342c : 0x7b5540, 7, [0, leg * 5, 3], [step, leg * 7, 15]);
+                const boot = project(step + 2, leg * 7, 16);
+                g.fillStyle(0x392b29).fillEllipse(boot.x, boot.y, 9 + side * 3, 6);
+            }
+            const drawQuiver = () => {
+                joint(0x865e42, 5, [-10, -5, 3], [-15, 6, -31]);
+                joint(0xe4d7a7, 2, [-14, 4, -26], [-16, 7, -36]);
+                joint(0xe4d7a7, 2, [-16, 7, -25], [-18, 10, -35]);
+            };
+            if (forward >= 0)
+                drawQuiver();
+            oval(0x153a31, -8, 0, 23 + (1 - side) * 7, 30);
+            oval(0x4e8063, -7, -3, 15 + (1 - side) * 7, 27);
+            oval(forward < 0 ? 0x234e3c : 0x795136, 0, -8, 22 + (1 - side) * 9, 27);
+            if (forward > -.35) {
+                oval(0x9c7552, 3, -9, 13 + (1 - side) * 5, 20);
+                oval(0xd5b272, 2, 1, 16 + (1 - side) * 8, 4);
+            }
+            if (forward < 0)
+                drawQuiver();
+            oval(0x234e3c, -1, -27, 27, 30);
+            oval(0x5f9071, -3, -34, 21, 14);
+            if (forward > -.45) {
+                const faceWidth = 15 + Math.max(0, forward) * 7;
+                oval(0xdba57d, 6, -25, faceWidth, 18);
+                oval(0xa65d35, 5, -32, faceWidth, 6);
+                const face = project(8, 0, -26);
+                const eyeSpacing = Math.max(0, forward) * 4;
+                g.fillStyle(0x26342c).fillEllipse(face.x + horizontal * 3 + eyeSpacing, face.y, 3, 2.5);
+                if (eyeSpacing > 2)
+                    g.fillEllipse(face.x + horizontal * 3 - eyeSpacing, face.y, 3, 2.5);
+            }
+            joint(0x59775a, 8, [2, -farSide * 8, -15], [12, -farSide * 7, -11]);
+            joint(0xe4b38d, 5, [12, -farSide * 7, -11], [21, 0, -12]);
+            joint(0xdcc390, 2, [23, -8, -27], [23, 8, 4]);
             g.lineStyle(3, 0xe7a85f).beginPath();
             for (let step = 0; step <= 12; step++) {
                 const angle = -1.4 + 2.8 * step / 12;
-                const bowX = 20 + Math.cos(angle) * 16;
-                const bowY = -12 + Math.sin(angle) * 16;
+                const curve = Math.cos(angle) - Math.cos(1.4);
+                const bend = project(23 + curve * 16, Math.sin(angle) * 8 - curve * 8, -12 + Math.sin(angle) * 16);
                 if (step === 0)
-                    g.moveTo(px(bowX), py(bowY, bowX));
+                    g.moveTo(bend.x, bend.y);
                 else
-                    g.lineTo(px(bowX), py(bowY, bowX));
+                    g.lineTo(bend.x, bend.y);
             }
             g.strokePath();
         }
@@ -447,6 +614,26 @@ class Forest extends Phaser.Scene {
             oval(0xa87a59, 28, -23, 7, 10);
             oval(0x8a9e62, 21, 0, 10, 9);
         }
+    }
+    paintWizard(point, heading, stride, clock) {
+        const g = this.art;
+        const { x, y } = point;
+        const bob = Math.abs(stride) * .45;
+        const faceX = x + Math.cos(heading) * 5;
+        const staffX = x + (Math.cos(heading) < 0 ? -19 : 19);
+        g.fillStyle(0x081311, .75).fillEllipse(x, y + 18, 44, 14);
+        g.fillStyle(0x737d87).fillTriangle(x - 5, y - 28 - bob, x - 20, y + 15, x + 15, y + 13);
+        g.fillStyle(0xdde0d7).fillTriangle(faceX, y - 29 - bob, x - 13, y + 13, x + 14, y + 13);
+        g.fillStyle(0xf6eedb).fillEllipse(faceX, y - 29 - bob, 20, 22);
+        if (Math.sin(heading) > -.45) {
+            g.fillStyle(0xc49c7b).fillEllipse(faceX, y - 28 - bob, 13, 9);
+            g.fillStyle(0xf7f6e9).fillTriangle(faceX - 8, y - 26 - bob, faceX + 8, y - 26 - bob, faceX, y - 9 - bob);
+        }
+        g.fillStyle(0xa8b0b4).fillTriangle(faceX - 11, y - 34 - bob, faceX + 4, y - 51 - bob, faceX + 12, y - 34 - bob);
+        g.fillStyle(0xe5e5da).fillEllipse(faceX, y - 34 - bob, 30, 6);
+        g.lineStyle(3, 0xa9845f).lineBetween(staffX, y - 36 - bob, staffX - 3, y + 16);
+        g.fillStyle(0x8fe7ff, .27).fillCircle(staffX, y - 39 - bob, 9 + Math.sin(clock * 5) * 2);
+        g.fillStyle(0xe7fbff).fillCircle(staffX, y - 39 - bob, 4);
     }
     paint(clock) {
         const g = this.art.clear();
@@ -506,11 +693,29 @@ class Forest extends Phaser.Scene {
             point: this.player, facing: this.heading,
             stride: this.walking ? Math.sin(clock * 17) * 4 : 0, elf: true
         });
+        for (const { kind, position, heading } of this.companions) {
+            g.lineStyle(2, 0x85e8fa, .85).strokeEllipse(position.x, position.y + 12, 44, 20);
+            actors.push({
+                point: position, facing: heading, stride: this.walking ? Math.sin(clock * 17 + 1) * 4 : 0,
+                elf: true, wizard: kind === 'wizard'
+            });
+        }
         actors.sort((a, b) => a.point.y - b.point.y);
-        for (const actor of actors)
-            this.paintCharacter(actor.point, actor.facing, actor.stride, actor.elf);
+        for (const actor of actors) {
+            if (actor.wizard)
+                this.paintWizard(actor.point, actor.facing, actor.stride, clock);
+            else
+                this.paintCharacter(actor.point, actor.facing, actor.stride, actor.elf);
+        }
         for (const arrow of this.arrows) {
-            g.lineStyle(3, 0xffe6a0, .95).lineBetween(arrow.x, arrow.y, arrow.x - arrow.vx * .029, arrow.y - arrow.vy * .029);
+            if (arrow.magic) {
+                g.lineStyle(5, 0x80dfff, .7).lineBetween(arrow.x, arrow.y, arrow.x - arrow.vx * .028, arrow.y - arrow.vy * .028);
+                g.fillStyle(0xb6edff, .25).fillCircle(arrow.x, arrow.y, 11);
+                g.fillStyle(0xe9fcff).fillCircle(arrow.x, arrow.y, 4);
+            }
+            else {
+                g.lineStyle(3, 0xffe6a0, .95).lineBetween(arrow.x, arrow.y, arrow.x - arrow.vx * .029, arrow.y - arrow.vy * .029);
+            }
         }
         for (const spark of this.sparks)
             g.fillStyle(spark.color, spark.life * 2).fillCircle(spark.x, spark.y, 2.6);
