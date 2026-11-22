@@ -1,0 +1,13 @@
+<!doctype html><html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#101b18"><title>Orman Muhafızı</title><link rel="stylesheet" href="./style.css?v=muzik-simgesi"><script defer src="./phaser.min.js"></script><script defer src="./game.js?v=dokunmatik-kontrol"></script></head>
+<body><main id="arena"><div id="field" aria-label="Orman arenası"></div><header><span class="crest" aria-hidden="true">✦</span><span>Orman Muhafızı</span><button id="pause" disabled aria-label="Oyunu duraklat">Ⅱ</button></header>
+<section id="hud" aria-label="Oyun durumu"><div><label for="health">Işık ağacı</label><progress id="health" max="100" value="100"></progress></div><div><span>Kalan süre</span><strong id="time">1:00</strong></div><div><span>Durdurulan ork</span><strong id="score">0</strong></div></section>
+<div id="shield" hidden>Kalkan etkin</div><div id="stick" aria-hidden="true" hidden><i></i></div>
+<section id="overlay" aria-labelledby="title"><div class="card"><div class="copy"><p class="eyebrow">Işık ağacının savunması</p><h1 id="title">Orman<br>Muhafızı</h1><p id="message">Orklar yaklaşıyor. Işık ağacını 60 saniye koru ve altın tohumları toplayarak ağaca kalkan ver.</p><button id="start" disabled>Oyunu başlat</button><p class="help"><span class="desktop">WASD veya yön tuşlarıyla ilerle. Fareyle nişan al ve basılı tutarak ateş et.</span><span class="mobile">Ok atmak için hedefe dokun. Hareket etmek için parmağını ekranda sürükle.</span></p></div><div class="portrait" aria-hidden="true"></div></div></section>
+<button type="button" id="music-toggle" aria-label="Müziği aç" title="Müziği aç" data-playing="false">
+<svg aria-hidden="true" width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+<path d="M3 9v6h4l5 4V5L7 9z"/>
+<path class="sound-waves" d="M15.5 9a4 4 0 0 1 0 6m2.5-8a7 7 0 0 1 0 10"/>
+<path class="sound-muted" d="m16 10 4 4m0-4-4 4"/>
+</svg></button>
+<audio id="intro-music" src="./giris-muzigi.mp3" loop preload="none"></audio>
+</main></body></html>
