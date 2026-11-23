@@ -15,6 +15,7 @@ const levels: Level[] = [
   { duration: 60, interval: 1.5, waves: [['orc', 'runner'], ['armored', 'orc'], ['orc', 'orc'], ['runner', 'orc']], threat: 'Orklar birden fazla kenardan saldırıyor.', palette: [0x382b31, 0x422f27, 0x1f1d25, 0x462f26] },
   { duration: 65, interval: 1.3, waves: [['armored', 'runner'], ['orc', 'runner'], ['armored', 'orc'], ['runner', 'orc', 'orc']], chief: true, threat: 'Ork şefi son 25 saniyede ortaya çıkacak.', palette: [0x3c233d, 0x46252d, 0x221627, 0x4d2d3e] }
 ];
+const laterLevelWaveRate = 1.15;
 const bonuses = [
   { kind: 'shield', label: 'Altın tohum', color: 0xffd578 },
   { kind: 'heal', label: 'Şifa özü', color: 0x93f6b0 },
@@ -23,7 +24,9 @@ const bonuses = [
 type Pickup = Point & { bonus: typeof bonuses[number]; expiresAt: number };
 type Arrow = Point & { vx: number; vy: number; life: number; magic?: boolean };
 type Spark = Arrow & { color: number };
-type Companion = { kind: 'archer' | 'wizard'; position: Point; heading: number; nextShot: number };
+type Bow = { releaseAt: number; drawTime: number; releasedAt: number };
+const createBow = (): Bow => ({ releaseAt: Infinity, drawTime: 0, releasedAt: -Infinity });
+type Companion = { bow: Bow; kind: 'archer' | 'wizard'; position: Point; heading: number; nextShot: number };
 
 function element<T extends HTMLElement>(id: string): T {
   return document.getElementById(id) as T;
@@ -152,6 +155,7 @@ class Forest extends Phaser.Scene {
   private nextShadow = 1;
   private nextBonus = 7;
   private nextShot = 0;
+  private bow = createBow();
   private protectedUntil = 0;
   private vitality = 100;
   private cleared = 0;
@@ -281,6 +285,7 @@ class Forest extends Phaser.Scene {
     this.shadows = [];
     this.arrows = [];
     this.companions = [];
+    this.bow = createBow();
     this.sparks = [];
     this.clearPopups();
     this.pickup = null;
@@ -313,6 +318,8 @@ class Forest extends Phaser.Scene {
     this.walking = false;
     this.firing = false;
     this.queuedShot = null;
+    this.bow = createBow();
+    for (const companion of this.companions) companion.bow = createBow();
     this.touch = null;
     this.aimTouch = null;
     stick.hidden = true;
@@ -338,6 +345,7 @@ class Forest extends Phaser.Scene {
   private finish(won: boolean) {
     this.mode = 'done';
     this.companions = [];
+    this.bow = createBow();
     this.pickup = null;
     this.protectedUntil = this.rapidUntil = this.noticeUntil = 0;
     if (this.points > this.record) {
@@ -410,7 +418,7 @@ class Forest extends Phaser.Scene {
   private recruit(kind: Companion['kind']) {
     this.companions.push({
       kind, position: this.companionPosition(kind === 'wizard' ? -1 : 1),
-      heading: this.heading, nextShot: this.elapsed
+      heading: this.heading, nextShot: this.elapsed, bow: createBow()
     });
   }
 
@@ -483,7 +491,8 @@ class Forest extends Phaser.Scene {
       const edge = Math.floor(Math.random() * 4);
       const wave = waves[this.wave++ % waves.length];
       wave.forEach((kind, index) => this.spawnEnemy(kind, (edge + index * 2 + Math.floor(index / 2)) % 4));
-      this.nextShadow = this.elapsed + interval * (1 - .25 * levelTime / duration);
+      const waveRate = this.level === 1 ? 1 : laterLevelWaveRate;
+      this.nextShadow = this.elapsed + interval * (1 - .25 * levelTime / duration) / waveRate;
     }
     if (chief && !this.chiefSpawned && levelTime >= duration - 25) {
       this.chiefSpawned = true;
@@ -504,10 +513,15 @@ class Forest extends Phaser.Scene {
     }
     const turn = Math.atan2(Math.sin(desired - this.heading), Math.cos(desired - this.heading));
     this.heading += Phaser.Math.Clamp(turn, -dt * 10, dt * 10);
-    if (hasTarget && Math.abs(turn) <= dt * 10 + .01 && this.elapsed >= this.nextShot) {
+    const rapid = this.elapsed < this.rapidUntil;
+    if (!hasTarget) this.bow.releaseAt = Infinity;
+    if (hasTarget && this.drawBow(this.bow, this.nextShot, rapid ? .09 : .17)
+        && Math.abs(turn) <= dt * 10 + .01) {
+      this.heading = desired;
+      this.releaseBow(this.bow);
       this.fireArrow(this.player, desired, .45);
       this.queuedShot = null;
-      this.nextShot = this.elapsed + (this.elapsed < this.rapidUntil ? .162 : .27);
+      this.nextShot = this.elapsed + (rapid ? .162 : .27);
     }
     for (const companion of this.companions) this.updateCompanion(companion);
     for (const arrow of this.arrows) {
@@ -562,8 +576,23 @@ class Forest extends Phaser.Scene {
     }
   }
 
+  private drawBow(bow: Bow, nextShot: number, drawTime: number) {
+    if (bow.releaseAt === Infinity && this.elapsed >= nextShot - drawTime) {
+      bow.drawTime = drawTime;
+      bow.releaseAt = this.elapsed + drawTime;
+    }
+    return this.elapsed >= bow.releaseAt;
+  }
+
+  private releaseBow(bow: Bow) {
+    bow.releaseAt = Infinity;
+    bow.releasedAt = this.elapsed;
+  }
+
   private fireArrow(origin: Point, heading: number, volume: number) {
-    this.arrows.push({ ...origin, vx: Math.cos(heading) * 635, vy: Math.sin(heading) * 635, life: 1.4 });
+    const vx = Math.cos(heading) * 635;
+    const vy = Math.sin(heading) * 635;
+    this.arrows.push({ ...origin, vx, vy, life: 1.4 });
     if (this.cache.audio.exists('arrow-swish')) this.sound.play('arrow-swish', { volume });
   }
 
@@ -589,16 +618,20 @@ class Forest extends Phaser.Scene {
       target = orc;
       closest = priority;
     }
-    if (!target) return;
+    if (!target) {
+      companion.bow.releaseAt = Infinity;
+      return;
+    }
     const { x, y } = companion.position;
     companion.heading = Math.atan2(target.y - y, target.x - x);
-    if (this.elapsed >= companion.nextShot) {
+    if (wizard ? this.elapsed >= companion.nextShot : this.drawBow(companion.bow, companion.nextShot, .24)) {
       if (wizard) {
         this.arrows.push({
           x, y, vx: Math.cos(companion.heading) * 635, vy: Math.sin(companion.heading) * 635,
           life: 1.4, magic: true
         });
       } else {
+        this.releaseBow(companion.bow);
         this.fireArrow(companion.position, companion.heading, .25);
       }
       companion.nextShot = this.elapsed + (wizard ? 1.35 : 1.15);
@@ -637,7 +670,7 @@ class Forest extends Phaser.Scene {
     }
   }
 
-  private paintCharacter(point: Point, facing: number, stride: number, elf: boolean, enemy?: Shadow) {
+  private paintCharacter(point: Point, facing: number, stride: number, elf: boolean, enemy?: Shadow, bow?: Bow) {
     const g = this.art;
     const { x, y } = point;
     const bob = Math.abs(stride) * .45;
@@ -711,18 +744,38 @@ class Forest extends Phaser.Scene {
         if (eyeSpacing > 2) g.fillEllipse(face.x + horizontal * 3 - eyeSpacing, face.y, 3, 2.5);
       }
 
-      joint(0x59775a, 8, [2, -farSide * 8, -15], [12, -farSide * 7, -11]);
-      joint(0xe4b38d, 5, [12, -farSide * 7, -11], [21, 0, -12]);
-      joint(0xdcc390, 2, [23, -8, -27], [23, 8, 4]);
+      const drawing = bow !== undefined && bow.releaseAt !== Infinity;
+      const pull = drawing
+        ? Phaser.Math.Clamp(1 - (bow.releaseAt - this.elapsed) / bow.drawTime, 0, 1)
+        : 0;
+      const recovery = bow ? Math.max(0, 1 - (this.elapsed - bow.releasedAt) / .07) : 0;
+      const extension = Math.max(pull, recovery);
+      const grip = 28 + extension * 4;
+      const height = -12 - extension * 6;
+      const string = grip - 12 - pull * 18;
+      const limb = (angle: number): [number, number, number] => {
+        const curve = (Math.cos(angle) - Math.cos(1.4)) / (1 - Math.cos(1.4));
+        return [grip - (12 + pull * 4) * (1 - curve), Math.sin(angle) * 8, height + Math.sin(angle) * 16];
+      };
+      const nock: [number, number, number] = [string, 0, height];
+
+      joint(0x59775a, 8, [2, -farSide * 8, -15], [grip * .55, -farSide * 6, height + 3]);
+      joint(0xe4b38d, 5, [grip * .55, -farSide * 6, height + 3], [grip, 0, height]);
+      if (drawing || recovery > 0) {
+        const elbow: [number, number, number] = [5 - extension * 15, farSide * 12, height + 4];
+        joint(0x43684f, 8, [0, farSide * 8, -15], elbow);
+        joint(0xe4b38d, 5, elbow, drawing ? nock : [2 - recovery * 7, 0, height]);
+      }
+      joint(0xdcc390, 1.5, limb(-1.4), nock);
+      joint(0xdcc390, 1.5, nock, limb(1.4));
       g.lineStyle(3, 0xe7a85f).beginPath();
       for (let step = 0; step <= 12; step++) {
-        const angle = -1.4 + 2.8 * step / 12;
-        const curve = Math.cos(angle) - Math.cos(1.4);
-        const bend = project(23 + curve * 16, Math.sin(angle) * 8 - curve * 8, -12 + Math.sin(angle) * 16);
+        const bend = project(...limb(-1.4 + 2.8 * step / 12));
         if (step === 0) g.moveTo(bend.x, bend.y);
         else g.lineTo(bend.x, bend.y);
       }
       g.strokePath();
+      if (drawing) joint(0xffe6a0, 2, nock, [string + 36, 0, height]);
     } else {
       line(0x383037, 9, -8,3, -10+stride,15);
       line(0x5a4350, 9, 7,3, 8-stride,15);
@@ -858,7 +911,7 @@ class Forest extends Phaser.Scene {
         g.fillTriangle(sx, lift + 12, sx - 8, lift, sx + 8, lift);
       }
     }
-    const actors = this.shadows.map<{ point: Point; facing: number; stride: number; elf: boolean; wizard?: boolean; enemy?: Shadow }>(shadow => ({
+    const actors = this.shadows.map<{ point: Point; facing: number; stride: number; elf: boolean; wizard?: boolean; enemy?: Shadow; bow?: Bow }>(shadow => ({
       point: shadow,
       facing: x >= shadow.x ? 1 : -1,
       stride: this.mode === 'playing' && distance(shadow, this.tree) > 42
@@ -867,19 +920,19 @@ class Forest extends Phaser.Scene {
     }));
     actors.push({
       point: this.player, facing: this.heading,
-      stride: this.walking ? Math.sin(clock * 17) * 4 : 0, elf: true
+      stride: this.walking ? Math.sin(clock * 17) * 4 : 0, elf: true, bow: this.bow
     });
-    for (const { kind, position, heading } of this.companions) {
+    for (const { kind, position, heading, bow } of this.companions) {
       g.lineStyle(2, 0x85e8fa, .85).strokeEllipse(position.x, position.y + 12, 44, 20);
       actors.push({
         point: position, facing: heading, stride: this.walking ? Math.sin(clock * 17 + 1) * 4 : 0,
-        elf: true, wizard: kind === 'wizard'
+        elf: true, wizard: kind === 'wizard', bow
       });
     }
     actors.sort((a, b) => a.point.y - b.point.y);
     for (const actor of actors) {
       if (actor.wizard) this.paintWizard(actor.point, actor.facing, actor.stride, clock);
-      else this.paintCharacter(actor.point, actor.facing, actor.stride, actor.elf, actor.enemy);
+      else this.paintCharacter(actor.point, actor.facing, actor.stride, actor.elf, actor.enemy, actor.bow);
       if (actor.enemy) this.paintEnemyStatus(actor.enemy);
     }
     for (const arrow of this.arrows) {
@@ -888,7 +941,10 @@ class Forest extends Phaser.Scene {
         g.fillStyle(0xb6edff, .25).fillCircle(arrow.x, arrow.y, 11);
         g.fillStyle(0xe9fcff).fillCircle(arrow.x, arrow.y, 4);
       } else {
-        g.lineStyle(3,0xffe6a0,.95).lineBetween(arrow.x,arrow.y,arrow.x-arrow.vx*.029,arrow.y-arrow.vy*.029);
+        const lift = Phaser.Math.Clamp(1 - (1.4 - arrow.life) / .2, 0, 1);
+        const tipX = arrow.x + arrow.vx / 635 * 38 * lift;
+        const tipY = arrow.y + (arrow.vy / 635 * 17 - 18) * lift;
+        g.lineStyle(3, 0xffe6a0, .95).lineBetween(tipX, tipY, tipX - arrow.vx * .029, tipY - arrow.vy * .029);
       }
     }
     for (const spark of this.sparks) g.fillStyle(spark.color,spark.life*2).fillCircle(spark.x,spark.y,2.6);
