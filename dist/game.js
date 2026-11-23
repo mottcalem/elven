@@ -1,4 +1,22 @@
 "use strict";
+const enemies = {
+    orc: { speed: 69, health: 1, damage: 7, points: 100, radius: 24, color: 0xb7c878 },
+    runner: { speed: 113, health: 1, damage: 7, points: 150, radius: 20, color: 0xf28e68 },
+    armored: { speed: 58, health: 3, damage: 11, points: 250, radius: 27, color: 0x9abbd5 },
+    chief: { speed: 56, health: 6, damage: 18, points: 750, radius: 33, color: 0xe2a6fb }
+};
+const levels = [
+    { duration: 45, interval: 2.2, waves: [['orc']], threat: 'Orklar Işık Ağacı’na yaklaşıyor.', palette: [0x142522, 0x101c27, 0x0c1716, 0x19322b] },
+    { duration: 50, interval: 1.9, waves: [['orc'], ['runner'], ['orc']], threat: 'Hızlı orklar aramıza karıştı.', palette: [0x233128, 0x242537, 0x10201e, 0x343d26] },
+    { duration: 55, interval: 1.7, waves: [['orc'], ['runner'], ['armored'], ['orc']], threat: 'Zırhlı orklar geliyor. Büyücü savunmaya katıldı.', palette: [0x21303e, 0x2e2946, 0x171f2b, 0x233f42] },
+    { duration: 60, interval: 1.5, waves: [['orc', 'runner'], ['armored', 'orc'], ['orc', 'orc'], ['runner', 'orc']], threat: 'Orklar birden fazla kenardan saldırıyor.', palette: [0x382b31, 0x422f27, 0x1f1d25, 0x462f26] },
+    { duration: 65, interval: 1.3, waves: [['armored', 'runner'], ['orc', 'runner'], ['armored', 'orc'], ['runner', 'orc', 'orc']], chief: true, threat: 'Ork şefi son 25 saniyede ortaya çıkacak.', palette: [0x3c233d, 0x46252d, 0x221627, 0x4d2d3e] }
+];
+const bonuses = [
+    { kind: 'shield', label: 'Altın tohum', color: 0xffd578 },
+    { kind: 'heal', label: 'Şifa özü', color: 0x93f6b0 },
+    { kind: 'rapid', label: 'Hızlı atış rünü', color: 0x9cceff }
+];
 function element(id) {
     return document.getElementById(id);
 }
@@ -11,10 +29,26 @@ const levelTransition = element('level-transition');
 const levelNumber = element('level-number');
 const title = element('title');
 const message = element('message');
+const hud = element('hud');
 const health = element('health');
 const time = element('time');
 const score = element('score');
-const shield = element('shield');
+const effects = element('effects');
+const notice = element('notice');
+const transitionTitle = element('transition-title');
+const transitionMessage = element('transition-message');
+const continueLevel = element('continue-level');
+const recordKey = 'orman-muhafizi.rekor';
+const formatScore = new Intl.NumberFormat('tr-TR');
+function loadRecord() {
+    try {
+        const value = Number(localStorage.getItem(recordKey));
+        return Number.isSafeInteger(value) && value > 0 ? value : 0;
+    }
+    catch {
+        return 0;
+    }
+}
 const stick = element('stick');
 const thumb = stick.querySelector('i');
 const field = element('field');
@@ -81,23 +115,34 @@ class Forest extends Phaser.Scene {
         this.pointer = null;
         this.firing = false;
         this.touch = null;
+        this.aimTouch = null;
         this.mode = 'intro';
         this.shadows = [];
         this.arrows = [];
         this.companions = [];
         this.sparks = [];
         this.scorePopups = new Set();
-        this.seed = null;
+        this.pickup = null;
         this.elapsed = 0;
         this.level = 1;
-        this.transitionRemaining = 0;
+        this.levelStarted = 0;
+        this.wave = 0;
+        this.chiefSpawned = false;
+        this.bonusIndex = 0;
+        this.points = 0;
+        this.record = loadRecord();
+        this.rapidUntil = 0;
+        this.noticeUntil = 0;
         this.nextShadow = 1;
-        this.nextSeed = 7;
+        this.nextBonus = 7;
         this.nextShot = 0;
         this.protectedUntil = 0;
         this.vitality = 100;
         this.cleared = 0;
         this.floor = [];
+    }
+    get currentLevel() {
+        return levels[this.level - 1];
     }
     preload() {
         this.load.audio('arrow-swish', './ok-efekti.mp3');
@@ -113,16 +158,18 @@ class Forest extends Phaser.Scene {
         start.addEventListener('click', () => {
             if (this.mode !== 'paused')
                 this.reset();
-            this.mode = 'playing';
-            this.playGameMusic();
-            pause.disabled = false;
-            overlay.hidden = true;
-            field.focus({ preventScroll: true });
+            this.resume();
             if (window.matchMedia('(any-pointer: coarse)').matches && document.fullscreenEnabled && !document.fullscreenElement) {
                 void arena.requestFullscreen().catch(() => {
                     // The arena still fills the available viewport.
                 });
             }
+        });
+        continueLevel.addEventListener('click', () => {
+            if (this.mode !== 'transition')
+                return;
+            levelTransition.hidden = true;
+            this.resume();
         });
         field.tabIndex = -1;
         pause.addEventListener('click', () => this.suspend());
@@ -148,8 +195,14 @@ class Forest extends Phaser.Scene {
             if (this.mode !== 'playing')
                 return;
             if (event.pointerType === 'touch') {
-                if (this.touch)
+                if (this.touch || this.aimTouch) {
+                    if (this.aimTouch)
+                        return;
+                    this.aimTouch = { id: event.pointerId, target: positionInField(event) };
+                    this.queuedShot = this.aimTouch.target;
+                    field.setPointerCapture(event.pointerId);
                     return;
+                }
                 const origin = positionInField(event);
                 this.touch = { id: event.pointerId, origin, current: origin, dragged: false };
                 stick.style.left = origin.x + 'px';
@@ -173,17 +226,24 @@ class Forest extends Phaser.Scene {
                 (_a = this.touch).dragged || (_a.dragged = distance(this.touch.origin, position) >= 10);
                 stick.hidden = !this.touch.dragged;
             }
+            if (this.aimTouch?.id === event.pointerId)
+                this.aimTouch.target = position;
             if (event.pointerType !== 'touch')
                 this.pointer = position;
         });
         const release = (event) => {
             if (this.touch?.id === event.pointerId) {
                 const position = positionInField(event);
-                if (event.type === 'pointerup' && !this.touch.dragged && distance(this.touch.origin, position) < 10) {
+                if (event.type === 'pointerup' && !this.aimTouch && !this.touch.dragged && distance(this.touch.origin, position) < 10) {
                     this.queuedShot = position;
                 }
                 this.touch = null;
                 stick.hidden = true;
+            }
+            if (this.aimTouch?.id === event.pointerId) {
+                this.aimTouch = null;
+                if (event.type !== 'pointerup')
+                    this.queuedShot = null;
             }
             if (event.pointerType !== 'touch')
                 this.firing = false;
@@ -202,9 +262,9 @@ class Forest extends Phaser.Scene {
             this.player = { x: width / 2, y: height * .72 };
         this.player.x = Phaser.Math.Clamp(this.player.x, 18, width - 18);
         this.player.y = Phaser.Math.Clamp(this.player.y, 18, height - 18);
-        if (this.seed) {
-            this.seed.x = Phaser.Math.Clamp(this.seed.x, 24, width - 24);
-            this.seed.y = Phaser.Math.Clamp(this.seed.y, 24, height - 24);
+        if (this.pickup) {
+            this.pickup.x = Phaser.Math.Clamp(this.pickup.x, 24, Math.max(24, width - 24));
+            this.pickup.y = Phaser.Math.Clamp(this.pickup.y, 24, Math.max(24, height - 24));
         }
     }
     reset() {
@@ -213,19 +273,17 @@ class Forest extends Phaser.Scene {
         gameMusic.currentTime = 0;
         this.elapsed = this.nextShot = this.protectedUntil = this.cleared = 0;
         this.level = 1;
+        this.levelStarted = this.wave = this.points = this.bonusIndex = this.rapidUntil = this.noticeUntil = 0;
+        this.chiefSpawned = false;
         this.nextShadow = 1;
-        this.nextSeed = 7;
+        this.nextBonus = 7;
         this.vitality = 100;
         this.shadows = [];
         this.arrows = [];
         this.companions = [];
         this.sparks = [];
-        for (const popup of this.scorePopups) {
-            this.tweens.killTweensOf(popup);
-            popup.destroy();
-        }
-        this.scorePopups.clear();
-        this.seed = null;
+        this.clearPopups();
+        this.pickup = null;
         this.player = { x: this.tree.x, y: this.scale.height * .72 };
         this.heading = 0;
         this.queuedShot = null;
@@ -233,14 +291,32 @@ class Forest extends Phaser.Scene {
         this.walking = false;
         this.status();
     }
-    display(heading, body, action) {
-        gameMusic.pause();
+    clearPopups() {
+        for (const popup of this.scorePopups) {
+            this.tweens.killTweensOf(popup);
+            popup.destroy();
+        }
+        this.scorePopups.clear();
+    }
+    resume() {
+        this.mode = 'playing';
+        this.playGameMusic();
+        pause.disabled = false;
+        overlay.hidden = true;
+        field.focus({ preventScroll: true });
+    }
+    clearInput() {
         this.keys.clear();
         this.walking = false;
         this.firing = false;
         this.queuedShot = null;
         this.touch = null;
+        this.aimTouch = null;
         stick.hidden = true;
+    }
+    display(heading, body, action) {
+        gameMusic.pause();
+        this.clearInput();
         pause.disabled = true;
         title.textContent = heading;
         message.textContent = body;
@@ -258,28 +334,38 @@ class Forest extends Phaser.Scene {
     finish(won) {
         this.mode = 'done';
         this.companions = [];
-        this.display(won ? 'Orman güvende!' : 'Ağacın ışığı söndü', won ? `${this.cleared} orku geri püskürttün. Işık ağacı yeniden parlıyor!`
-            : `${this.cleared} orku geri püskürttün. Altın tohumlar, ağacı kısa süre korur.`, 'Yeniden oyna');
+        this.pickup = null;
+        this.protectedUntil = this.rapidUntil = this.noticeUntil = 0;
+        if (this.points > this.record) {
+            this.record = this.points;
+            try {
+                localStorage.setItem(recordKey, String(this.record));
+            }
+            catch {
+                // The scene keeps the record for this session.
+            }
+        }
+        this.status();
+        this.display(won ? 'Orman güvende!' : 'Ağacın ışığı söndü', `${formatScore.format(this.points)} puan · Seviye ${this.level}/${levels.length} · ${this.cleared} ork yenildi · Rekor ${formatScore.format(this.record)}`, 'Yeniden oyna');
     }
     status() {
-        const remaining = Math.ceil(this.level * 60 - this.elapsed);
+        const remaining = Math.max(0, Math.ceil(this.currentLevel.duration - (this.elapsed - this.levelStarted)));
         time.textContent = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`;
-        levelNumber.textContent = String(this.level);
+        levelNumber.textContent = `${this.level}/${levels.length}`;
         health.value = Math.max(0, this.vitality);
-        score.textContent = String(this.cleared);
-        shield.hidden = this.elapsed >= this.protectedUntil;
+        score.textContent = formatScore.format(this.points);
+        const active = [];
+        if (this.protectedUntil > this.elapsed)
+            active.push(`Kalkan ${Math.ceil(this.protectedUntil - this.elapsed)} sn`);
+        if (this.rapidUntil > this.elapsed)
+            active.push(`Hızlı atış ${Math.ceil(this.rapidUntil - this.elapsed)} sn`);
+        effects.textContent = active.join(' · ');
+        effects.hidden = !active.length;
+        notice.hidden = this.elapsed >= this.noticeUntil;
     }
     update(clock, delta) {
         if (this.mode === 'playing')
             this.step(Math.min(.05, delta / 1000));
-        else if (this.mode === 'transition') {
-            this.transitionRemaining -= delta;
-            if (this.transitionRemaining <= 0) {
-                levelTransition.hidden = true;
-                this.mode = 'playing';
-                pause.disabled = false;
-            }
-        }
         this.paint(clock / 1000);
     }
     playGameMusic() {
@@ -289,31 +375,90 @@ class Forest extends Phaser.Scene {
     }
     advanceLevel() {
         this.mode = 'transition';
-        this.level = 2;
-        this.companions.push({
-            kind: 'wizard', position: this.companionPosition(-1), heading: this.heading,
-            expiresAt: 120, nextShot: this.elapsed
-        });
-        gameMusic.src = './ikinci-seviye-muzigi.mp3';
-        this.playGameMusic();
-        this.transitionRemaining = 2500;
+        this.level++;
+        this.levelStarted = this.elapsed;
+        this.wave = 0;
+        this.chiefSpawned = false;
+        if (this.level === 3)
+            this.recruit('wizard');
+        if (this.level === 2)
+            gameMusic.src = './ikinci-seviye-muzigi.mp3';
+        gameMusic.pause();
         this.nextShadow = this.elapsed + 1.2;
-        this.vitality = Math.min(100, this.vitality + 25);
+        this.nextBonus = this.elapsed + 7;
+        this.nextShot = this.elapsed;
+        this.protectedUntil = this.rapidUntil = this.noticeUntil = 0;
+        this.pickup = null;
+        this.vitality = Math.min(100, this.vitality + 20);
         this.shadows = [];
         this.arrows = [];
-        this.keys.clear();
-        this.walking = false;
-        this.firing = false;
-        this.queuedShot = null;
-        this.touch = null;
-        stick.hidden = true;
+        this.sparks = [];
+        this.clearPopups();
+        this.clearInput();
         pause.disabled = true;
-        this.burst(this.tree, 0xffdf85);
         this.status();
+        transitionTitle.textContent = `Seviye ${this.level}`;
+        transitionMessage.textContent = this.currentLevel.threat;
         levelTransition.hidden = false;
+        continueLevel.focus({ preventScroll: true });
+    }
+    recruit(kind) {
+        this.companions.push({
+            kind, position: this.companionPosition(kind === 'wizard' ? -1 : 1),
+            heading: this.heading, nextShot: this.elapsed
+        });
+    }
+    spawnEnemy(kind, edge) {
+        const { width, height } = this.scale;
+        const position = .12 + Math.random() * .76;
+        const margin = enemies[kind].radius + 8;
+        const x = edge === 1 ? width + margin : edge === 3 ? -margin : width * position;
+        const y = edge === 0 ? -margin : edge === 2 ? height + margin : height * position;
+        const { speed, health } = enemies[kind];
+        this.shadows.push({ kind, x, y, speed: speed + (this.level - 1) * 3, health, attack: 0, hitUntil: 0 });
+    }
+    updatePickup() {
+        if (!this.pickup && this.elapsed >= this.nextBonus) {
+            const { width, height } = this.scale;
+            const angle = Math.random() * Math.PI * 2;
+            const radius = Math.min(width, height) * .29;
+            const top = hud.offsetTop + hud.offsetHeight + 24;
+            this.pickup = {
+                x: Phaser.Math.Clamp(this.tree.x + Math.cos(angle) * radius, 24, Math.max(24, width - 24)),
+                y: Phaser.Math.Clamp(this.tree.y + Math.sin(angle) * radius, Math.min(top, height / 2), Math.max(height / 2, height - 34)),
+                bonus: bonuses[this.bonusIndex++ % bonuses.length], expiresAt: this.elapsed + 10
+            };
+        }
+        if (!this.pickup)
+            return;
+        const expired = this.elapsed >= this.pickup.expiresAt;
+        if (!expired && distance(this.pickup, this.player) >= 29)
+            return;
+        if (!expired) {
+            const { bonus } = this.pickup;
+            if (bonus.kind === 'shield')
+                this.protectedUntil = this.elapsed + 7;
+            if (bonus.kind === 'heal')
+                this.vitality = Math.min(100, this.vitality + 20);
+            if (bonus.kind === 'rapid') {
+                this.rapidUntil = this.elapsed + 8;
+                this.nextShot = Math.min(this.nextShot, this.elapsed + .162);
+            }
+            this.announce(bonus.label);
+            this.burst(this.pickup, bonus.color);
+        }
+        this.pickup = null;
+        this.nextBonus = this.elapsed + 8;
+    }
+    announce(label) {
+        notice.textContent = label;
+        this.noticeUntil = this.elapsed + 2.5;
     }
     step(dt) {
-        this.elapsed = Math.min(this.level * 60, this.elapsed + dt);
+        const { duration, interval, waves, chief } = this.currentLevel;
+        const levelEnd = this.levelStarted + duration;
+        this.elapsed = Math.min(levelEnd, this.elapsed + dt);
+        const levelTime = this.elapsed - this.levelStarted;
         const { width, height } = this.scale;
         const held = (one, two) => Number(this.keys.has(one) || this.keys.has(two));
         let dx = held('KeyD', 'ArrowRight') - held('KeyA', 'ArrowLeft');
@@ -328,34 +473,19 @@ class Forest extends Phaser.Scene {
         this.walking = Math.hypot(dx, dy) > .06;
         this.player.x = Phaser.Math.Clamp(this.player.x + dx / length * dt * 225, 18, width - 18);
         this.player.y = Phaser.Math.Clamp(this.player.y + dy / length * dt * 225, 18, height - 18);
-        if (this.elapsed >= this.nextShadow) {
-            const waveAngle = Math.random() * Math.PI * 2;
-            const levelTime = this.elapsed - (this.level - 1) * 60;
-            const waveSize = this.level === 1 ? 1 : levelTime < 30 ? 2 : 3;
-            for (let index = 0; index < waveSize; index++) {
-                const angle = waveAngle + index * Math.PI * 2 / waveSize;
-                const reach = Math.max(width, height);
-                this.shadows.push({
-                    x: Phaser.Math.Clamp(this.tree.x + Math.cos(angle) * reach, -18, width + 18),
-                    y: Phaser.Math.Clamp(this.tree.y + Math.sin(angle) * reach, -18, height + 18),
-                    speed: 58 + levelTime * .8 + (this.level - 1) * 12 + Math.random() * 18, attack: 0
-                });
-            }
-            const interval = this.level === 1 ? 2.15 - levelTime * .027 : 1.75 - levelTime * .014;
-            this.nextShadow = this.elapsed + Math.max(.57, interval);
+        if (this.elapsed >= this.nextShadow && this.elapsed < levelEnd) {
+            const edge = Math.floor(Math.random() * 4);
+            const wave = waves[this.wave++ % waves.length];
+            wave.forEach((kind, index) => this.spawnEnemy(kind, (edge + index * 2 + Math.floor(index / 2)) % 4));
+            this.nextShadow = this.elapsed + interval * (1 - .25 * levelTime / duration);
         }
-        if (!this.seed && this.elapsed >= this.nextSeed) {
-            const angle = Math.random() * Math.PI * 2;
-            const radius = Math.min(width, height) * .3;
-            this.seed = { x: this.tree.x + Math.cos(angle) * radius, y: this.tree.y + Math.sin(angle) * radius };
+        if (chief && !this.chiefSpawned && levelTime >= duration - 25) {
+            this.chiefSpawned = true;
+            this.spawnEnemy('chief', Math.floor(Math.random() * 4));
+            this.announce('Ork şefi saldırıyor!');
         }
-        if (this.seed && distance(this.seed, this.player) < 29) {
-            this.burst(this.seed, 0xffdd7d);
-            this.seed = null;
-            this.nextSeed = this.elapsed + 11;
-            this.protectedUntil = this.elapsed + 7;
-        }
-        const target = this.firing ? this.pointer : this.queuedShot;
+        this.updatePickup();
+        const target = this.aimTouch?.target ?? (this.firing ? this.pointer : this.queuedShot);
         if (target && distance(target, this.player) < 4)
             this.queuedShot = null;
         const hasTarget = target && distance(target, this.player) >= 4;
@@ -372,9 +502,8 @@ class Forest extends Phaser.Scene {
         if (hasTarget && Math.abs(turn) <= dt * 10 + .01 && this.elapsed >= this.nextShot) {
             this.fireArrow(this.player, desired, .45);
             this.queuedShot = null;
-            this.nextShot = this.elapsed + .27;
+            this.nextShot = this.elapsed + (this.elapsed < this.rapidUntil ? .162 : .27);
         }
-        this.companions = this.companions.filter(companion => this.elapsed < companion.expiresAt);
         for (const companion of this.companions)
             this.updateCompanion(companion);
         for (const arrow of this.arrows) {
@@ -383,20 +512,24 @@ class Forest extends Phaser.Scene {
             arrow.life -= dt;
             if (arrow.life <= 0)
                 continue;
-            const hit = this.shadows.findIndex(shadow => distance(shadow, arrow) < 24);
+            const hit = this.shadows.findIndex(shadow => distance(shadow, arrow) < enemies[shadow.kind].radius);
             if (hit < 0)
                 continue;
             const orc = this.shadows[hit];
             this.burst(orc, arrow.magic ? 0xa7efff : 0xffe6a1);
-            this.shadows.splice(hit, 1);
             arrow.life = 0;
+            orc.health -= arrow.magic ? 2 : 1;
+            orc.hitUntil = this.elapsed + .12;
+            if (orc.health > 0)
+                continue;
+            this.shadows.splice(hit, 1);
             this.cleared++;
-            this.showHitScore(orc);
+            const earned = enemies[orc.kind].points;
+            this.points += earned;
+            this.showHitScore(orc, earned);
             if (this.cleared === 10) {
-                this.companions.push({
-                    kind: 'archer', position: this.companionPosition(1), heading: this.heading,
-                    expiresAt: this.elapsed + 10, nextShot: this.elapsed
-                });
+                this.recruit('archer');
+                this.announce('Elf okçu savunmaya katıldı');
             }
         }
         this.arrows = this.arrows.filter(arrow => arrow.life > 0);
@@ -409,7 +542,7 @@ class Forest extends Phaser.Scene {
             }
             else if (shadow.attack <= this.elapsed) {
                 if (this.elapsed >= this.protectedUntil)
-                    this.vitality -= 7;
+                    this.vitality = Math.max(0, this.vitality - enemies[shadow.kind].damage);
                 this.burst(this.tree, this.elapsed >= this.protectedUntil ? 0xeea880 : 0x93f6d0);
                 shadow.attack = this.elapsed + 1.1;
             }
@@ -423,8 +556,9 @@ class Forest extends Phaser.Scene {
         this.status();
         if (this.vitality <= 0)
             this.finish(false);
-        else if (this.elapsed >= this.level * 60) {
-            if (this.level === 1)
+        else if (this.elapsed >= levelEnd) {
+            this.points += 500 + this.vitality * 5;
+            if (this.level < levels.length)
                 this.advanceLevel();
             else
                 this.finish(true);
@@ -447,13 +581,17 @@ class Forest extends Phaser.Scene {
         const wizard = companion.kind === 'wizard';
         companion.position = this.companionPosition(wizard ? -1 : 1);
         let target = null;
-        let closest = 635 * 1.4;
+        let closest = Infinity;
+        const range = wizard ? 270 : 220;
         for (const orc of this.shadows) {
             const gap = distance(companion.position, orc);
-            if (gap >= closest)
+            if (gap > range)
+                continue;
+            const priority = gap - (wizard && orc.kind === 'armored' ? range : 0);
+            if (priority >= closest)
                 continue;
             target = orc;
-            closest = gap;
+            closest = priority;
         }
         if (!target)
             return;
@@ -469,13 +607,13 @@ class Forest extends Phaser.Scene {
             else {
                 this.fireArrow(companion.position, companion.heading, .25);
             }
-            companion.nextShot = this.elapsed + (wizard ? .9 : .6);
+            companion.nextShot = this.elapsed + (wizard ? 1.35 : 1.15);
         }
     }
-    showHitScore(point) {
+    showHitScore(point, earned) {
         const x = Phaser.Math.Clamp(point.x, 22, this.scale.width - 22);
         const y = Math.max(52, point.y - 35);
-        const popup = this.add.text(x, y, '+1', {
+        const popup = this.add.text(x, y, '+' + earned, {
             fontFamily: 'system-ui, sans-serif',
             fontSize: '25px',
             fontStyle: 'bold',
@@ -502,7 +640,7 @@ class Forest extends Phaser.Scene {
             this.sparks.push({ ...point, vx: Math.cos(angle) * 85, vy: Math.sin(angle) * 85, life: .48, color });
         }
     }
-    paintCharacter(point, facing, stride, elf) {
+    paintCharacter(point, facing, stride, elf, enemy) {
         const g = this.art;
         const { x, y } = point;
         const bob = Math.abs(stride) * .45;
@@ -613,6 +751,19 @@ class Forest extends Phaser.Scene {
             oval(0x6f5143, 27, -20, 12, 18);
             oval(0xa87a59, 28, -23, 7, 10);
             oval(0x8a9e62, 21, 0, 10, 9);
+            if (enemy?.kind === 'runner') {
+                polygon(0xc25943, [6, -19, -28, -14, -41, -3, -11, -8, 9, -13]);
+            }
+            else if (enemy?.kind === 'armored') {
+                oval(0x304352, 20, -8, 27, 35);
+                oval(0x91b2ca, 21, -9, 21, 28);
+                oval(0x435e72, 22, -9, 9, 12);
+            }
+            else if (enemy?.kind === 'chief') {
+                polygon(0xe8bc68, [-16, -31, -23, -53, -8, -44, 0, -58, 9, -44, 22, -53, 15, -31]);
+                line(0x7b533e, 6, 23, 7, 34, -31);
+                oval(0xbe88c5, 36, -33, 22, 28);
+            }
         }
     }
     paintWizard(point, heading, stride, clock) {
@@ -635,11 +786,25 @@ class Forest extends Phaser.Scene {
         g.fillStyle(0x8fe7ff, .27).fillCircle(staffX, y - 39 - bob, 9 + Math.sin(clock * 5) * 2);
         g.fillStyle(0xe7fbff).fillCircle(staffX, y - 39 - bob, 4);
     }
+    paintEnemyStatus(enemy) {
+        const { x, y, kind } = enemy;
+        const stats = enemies[kind];
+        const g = this.art;
+        if (enemy.hitUntil > this.elapsed) {
+            g.fillStyle(0xffedcf, .38).fillEllipse(x, y - 14, stats.radius * 2, 43);
+        }
+        if (stats.health > 1) {
+            const width = kind === 'chief' ? 62 : 38;
+            const top = y - (kind === 'chief' ? 67 : 50);
+            g.fillStyle(0x101b18, .95).fillRoundedRect(x - width / 2, top, width, 6, 2);
+            g.fillStyle(stats.color).fillRoundedRect(x - width / 2, top, width * enemy.health / stats.health, 6, 2);
+        }
+    }
     paint(clock) {
         const g = this.art.clear();
         const { width, height } = this.scale;
         const { x, y } = this.tree;
-        g.fillGradientStyle(0x142522, 0x101c27, 0x0c1716, 0x19322b).fillRect(0, 0, width, height);
+        g.fillGradientStyle(...this.currentLevel.palette).fillRect(0, 0, width, height);
         for (let ring = 9; ring > 0; ring--) {
             g.fillStyle(0x638157, .047).fillEllipse(x, y + 18, width * ring / 10, height * ring / 11);
         }
@@ -662,32 +827,43 @@ class Forest extends Phaser.Scene {
             g.lineStyle(2, 0x9af7d0, .8).strokeCircle(x, y, 63);
         }
         g.fillStyle(0x111d18, .8).fillEllipse(x, y + 22, 108, 52);
+        const light = .18 + .82 * this.vitality / 100;
         for (let ring = 7; ring > 0; ring--)
-            g.fillStyle(0xe9d982, .045).fillCircle(x, y - 27, ring * 11);
+            g.fillStyle(0xe9d982, .045 * light).fillCircle(x, y - 27, ring * 11);
         g.lineStyle(11, 0x665639).lineBetween(x - 6, y + 20, x + 2, y - 39);
         g.lineStyle(5, 0x9b8653).lineBetween(x, y - 12, x - 21, y - 38).lineBetween(x, y - 21, x + 23, y - 49);
         for (const [ox, oy, r] of [[-27, -39, 19], [-15, -54, 20], [5, -59, 25], [24, -49, 21], [11, -35, 21]]) {
             g.fillStyle(0x729260, .94).fillCircle(x + ox, y + oy, r);
-            g.fillStyle(0xd5db89, .5).fillCircle(x + ox - 5, y + oy - 5, r * .76);
+            g.fillStyle(0xd5db89, .5 * light).fillCircle(x + ox - 5, y + oy - 5, r * .76);
         }
         for (let i = 0; i < 11; i++) {
             const angle = i * 2.4 + clock * .35;
-            g.fillStyle(0xffe6a2, .7).fillCircle(x + Math.cos(angle) * (22 + i * 2), y - 42 + Math.sin(angle) * (18 + i), 1.5);
+            g.fillStyle(0xffe6a2, .7 * light).fillCircle(x + Math.cos(angle) * (22 + i * 2), y - 42 + Math.sin(angle) * (18 + i), 1.5);
         }
-        if (this.seed) {
-            const { x: sx, y: sy } = this.seed;
-            const lift = Math.sin(clock * 4) * 4;
-            g.fillStyle(0xffd578, .17).fillCircle(sx, sy, 22);
-            g.lineStyle(1, 0xffd578, .55).strokeCircle(sx, sy, 18);
-            g.fillStyle(0xffdb78).fillTriangle(sx, sy - 12 + lift, sx - 8, sy + lift, sx + 8, sy + lift);
-            g.fillTriangle(sx, sy + 12 + lift, sx - 8, sy + lift, sx + 8, sy + lift);
+        if (this.pickup) {
+            const { x: sx, y: sy, bonus } = this.pickup;
+            const lift = sy + Math.sin(clock * 4) * 4;
+            g.fillStyle(bonus.color, .22).fillCircle(sx, sy, 22);
+            g.lineStyle(2, bonus.color, .75).strokeCircle(sx, sy, 18);
+            g.fillStyle(bonus.color);
+            if (bonus.kind === 'heal') {
+                g.fillRect(sx - 3, lift - 10, 6, 20).fillRect(sx - 10, lift - 3, 20, 6);
+            }
+            else if (bonus.kind === 'rapid') {
+                g.fillTriangle(sx - 9, lift - 9, sx - 9, lift + 9, sx + 2, lift);
+                g.fillTriangle(sx, lift - 9, sx, lift + 9, sx + 11, lift);
+            }
+            else {
+                g.fillTriangle(sx, lift - 12, sx - 8, lift, sx + 8, lift);
+                g.fillTriangle(sx, lift + 12, sx - 8, lift, sx + 8, lift);
+            }
         }
         const actors = this.shadows.map(shadow => ({
             point: shadow,
             facing: x >= shadow.x ? 1 : -1,
             stride: this.mode === 'playing' && distance(shadow, this.tree) > 42
                 ? Math.sin(clock * 12 + shadow.speed) * 4 : 0,
-            elf: false
+            elf: false, enemy: shadow
         }));
         actors.push({
             point: this.player, facing: this.heading,
@@ -705,7 +881,9 @@ class Forest extends Phaser.Scene {
             if (actor.wizard)
                 this.paintWizard(actor.point, actor.facing, actor.stride, clock);
             else
-                this.paintCharacter(actor.point, actor.facing, actor.stride, actor.elf);
+                this.paintCharacter(actor.point, actor.facing, actor.stride, actor.elf, actor.enemy);
+            if (actor.enemy)
+                this.paintEnemyStatus(actor.enemy);
         }
         for (const arrow of this.arrows) {
             if (arrow.magic) {
